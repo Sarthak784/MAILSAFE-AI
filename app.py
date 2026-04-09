@@ -1,9 +1,9 @@
 """
 app.py
 ------
-MAILSAFE AI — End-to-End Streamlit Dashboard
+MAILSAFE AI — Behavioral Anomaly Dashboard
 Upload a raw Enron-style CSV (columns: 'file', 'message') and the app
-runs the full pipeline: parse → feature engineer → model → results.
+runs batch anomaly profiling: parse → feature engineer → score against pre-trained model → results.
 
 Run with:  streamlit run app.py
 """
@@ -65,20 +65,23 @@ FEATURE_COLS = [
 # ══════════════════════════════════════════════════════════
 
 def parse_raw_csv(file_bytes: bytes, max_emails: int = 50_000) -> pd.DataFrame:
-    """Parse a raw Enron-style CSV (columns: file, message) directly from bytes."""
-    csv.field_size_limit(min(sys.maxsize, 2_147_483_647))
+    """Parse a raw Enron-style CSV (columns: file, message) directly from bytes using Pandas."""
     parser = EmailParser()
     records = []
 
-    reader = csv.DictReader(io.TextIOWrapper(io.BytesIO(file_bytes), encoding="utf-8", errors="replace"))
-    for i, row in enumerate(reader):
-        if max_emails and i >= max_emails:
-            break
-        raw = row.get("message", "")
-        if not raw:
-            continue
+    # Use pandas to read the CSV directly from bytes. It's much faster and handles 
+    # quoted multi-line strings far better than Python's native csv module.
+    try:
+        raw_df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8", on_bad_lines="skip", nrows=max_emails)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        return pd.DataFrame()
 
-        msg        = parser.parsestr(raw)
+    if "message" not in raw_df.columns:
+        return pd.DataFrame()
+
+    for raw in raw_df["message"].dropna():
+        msg        = parser.parsestr(str(raw))
         sender     = msg.get("From", "").strip().lower()
         to_raw     = msg.get("To", "") or ""
         cc_raw     = msg.get("Cc", "") or ""
@@ -88,14 +91,6 @@ def parse_raw_csv(file_bytes: bytes, max_emails: int = 50_000) -> pd.DataFrame:
         to_list    = [r.strip().lower() for r in re.split(r"[,;]", to_raw) if r.strip()]
         cc_list    = [r.strip().lower() for r in re.split(r"[,;]", cc_raw) if r.strip()]
         recipients = list(set(to_list + cc_list))
-
-        # Load pre-trained models
-        model_dir = Path(__file__).parent
-        try:
-            scaler = joblib.load(model_dir / "scaler.pkl")
-            model = joblib.load(model_dir / "isolation_forest.pkl")
-        except FileNotFoundError:
-            pass
 
         timestamp = None
         if date_raw:
@@ -178,21 +173,35 @@ def build_profiles(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_model(profiles: pd.DataFrame, contamination: float = 0.10) -> pd.DataFrame:
-    """Train Isolation Forest and return results df with anomaly_score."""
-    scaler = StandardScaler()
-    X = scaler.fit_transform(profiles[FEATURE_COLS])
+    """Score profiles using the pre-trained Isolation Forest."""
+    # Load pre-trained models
+    model_dir = Path(__file__).parent
+    try:
+        scaler = joblib.load(model_dir / "scaler.pkl")
+        model = joblib.load(model_dir / "isolation_forest.pkl")
+    except FileNotFoundError:
+        st.error("Pre-trained model files not found in the root directory. Cannot score senders.")
+        st.stop()
 
-    model = IsolationForest(n_estimators=200, contamination=contamination,
-                            random_state=42, n_jobs=-1)
-    model.fit(X)
-
-    raw    = model.decision_function(X)
+    # Pre-trained model handles scaling, but we need the original features
+    X = scaler.transform(profiles[FEATURE_COLS])
+    
+    raw = model.decision_function(X)
     labels = model.predict(X)                   # -1 = anomaly
+    
+    # Calculate anomaly score using min/max from the original training run
+    # For a robust proxy, we use the theoretical range of IF decision function roughly [-0.5, 0.5] if min/max aren't saved
+    # or we can approximate using the current batch min/max for display purposes if the batch is large enough.
+    # To keep scores comparable, it's best to use fixed min/max or the batch min/max if necessary. Let's use batch for now if we don't have saved limits.
     mn, mx = raw.min(), raw.max()
     scores = 100 * (1 - (raw - mn) / (mx - mn + 1e-9))
 
     pca    = PCA(n_components=2, random_state=42)
-    coords = pca.fit_transform(X)
+    # Handle cases where there might be fewer than 2 samples
+    if len(X) >= 2:
+        coords = pca.fit_transform(X)
+    else:
+        coords = np.zeros((len(X), 2))
 
     out                    = profiles.copy()
     out["anomaly_score"]   = np.round(scores, 2)
@@ -232,13 +241,13 @@ def demo_results() -> pd.DataFrame:
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/shield.png", width=64)
     st.title("MAILSAFE AI")
-    st.caption("End-to-end Behavioral Scam Detection")
+    st.caption("Batch Behavioral Anomaly Profiling")
     st.divider()
 
     st.subheader("Upload Raw Email CSV")
     st.markdown(
-        "Upload your **raw Enron-style CSV** (columns: `file`, `message`). "
-        "The app will parse, profile, and score all senders automatically."
+        "Upload a **raw Enron-style CSV** (columns: `file`, `message`). "
+        "The app parses the data and scores senders against the pre-trained Isolation Forest."
     )
     uploaded = st.file_uploader("Upload CSV", type="csv", label_visibility="collapsed")
 
@@ -259,7 +268,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════
 
 st.title("MAILSAFE AI")
-st.markdown("**End-to-End Scam Email Sender Detection — Upload Raw Email CSV to Begin**")
+st.markdown("**Behavioral Anomaly Detection — Flags senders whose email patterns deviate significantly from the norm.**")
 st.divider()
 
 if uploaded is not None:
@@ -282,10 +291,10 @@ if uploaded is not None:
             profiles_df = build_profiles(parsed_df)
             st.write(f"✅ Profiled **{len(profiles_df):,}** unique senders.")
 
-            st.write("🤖 Training Isolation Forest model…")
+            st.write("🤖 Scoring against pre-trained Isolation Forest model…")
             results_df  = run_model(profiles_df)
             flagged_n   = int(results_df["is_anomaly"].sum())
-            st.write(f"✅ Model complete — **{flagged_n}** senders flagged.")
+            st.write(f"✅ Scoring complete — **{flagged_n}** senders flagged as anomalous.")
             status.update(label="✅ Pipeline complete!", state="complete", expanded=False)
 
     df = results_df.reset_index()      # 'sender' becomes a column
@@ -505,4 +514,4 @@ if search_query:
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("MAILSAFE AI · End-to-End Behavioral Anomaly Detection · Isolation Forest + Streamlit")
+st.caption("MAILSAFE AI · Batch Behavioral Anomaly Profiling · Isolation Forest + Streamlit")
